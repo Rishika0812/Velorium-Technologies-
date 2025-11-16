@@ -5,10 +5,9 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-import scipy.stats as stats
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -18,18 +17,6 @@ try:
     SCIPY_AVAILABLE = True
 except Exception:
     SCIPY_AVAILABLE = False
-
-# Optional OpenAI integration for generative email drafts
-try:
-    import importlib
-    spec = importlib.util.find_spec("openai")
-    if spec is not None:
-        openai = importlib.import_module("openai")
-        OPENAI_AVAILABLE = True
-    else:
-        OPENAI_AVAILABLE = False
-except Exception:
-    OPENAI_AVAILABLE = False
 
 # Configure page
 st.set_page_config(
@@ -63,37 +50,18 @@ st.markdown("""
         color: #388e3c;
         font-weight: bold;
     }
-    /* White card style for readability: black text on white background */
     .recommendation-box {
-        background-color: #ffffff;
-        color: #000000;
-        padding: 16px;
+        background-color: #f0f7ff;
+        padding: 15px;
         border-radius: 8px;
         border-left: 4px solid #2196F3;
         margin: 10px 0;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.06);
     }
     .action-box {
-        background-color: #ffffff;
-        color: #000000;
+        background-color: #f5f5f5;
         padding: 12px;
         border-radius: 6px;
         margin: 8px 0;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-    }
-    /* Chart card wrapper */
-    .chart-card {
-        background: #ffffff;
-        color: #000000;
-        padding: 12px;
-        border-radius: 8px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        margin-bottom: 12px;
-    }
-    /* Ensure input and textarea are black-on-white for readability */
-    textarea, input[type="text"] {
-        color: #000 !important;
-        background: #fff !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -240,9 +208,9 @@ def load_data(source):
 
 @st.cache_resource
 def train_attrition_model(df: pd.DataFrame, numeric_cols: list, categorical_cols: list):
-    """Train Random Forest model for attrition prediction with randomized CV search"""
+    """Train Random Forest model for attrition prediction"""
     df_model = df.copy()
-
+    
     # Encode categorical variables
     le_dict = {}
     for col in categorical_cols:
@@ -250,57 +218,28 @@ def train_attrition_model(df: pd.DataFrame, numeric_cols: list, categorical_cols
             le = LabelEncoder()
             df_model[col] = le.fit_transform(df_model[col].fillna('Unknown'))
             le_dict[col] = le
-
+    
     # Select features for model
     feature_cols = [c for c in numeric_cols if c != ID_FIELD and c != ATTRITION_FIELD] + [c for c in categorical_cols if c != ATTRITION_FIELD]
-
+    
     X = df_model[feature_cols].fillna(df_model[feature_cols].mean())
     y = df_model[ATTRITION_FIELD].fillna(0)
-
-    # Split for quick validation (stratified)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-
+    
     # Scale features
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Hyperparameter search (small randomized search to improve accuracy without long training)
-    param_dist = {
-        'n_estimators': [50, 75, 100, 150],
-        'max_depth': [6, 8, 10, None],
-        'min_samples_split': [2, 4, 8],
-        'min_samples_leaf': [1, 2, 4]
-    }
-
-    base_model = RandomForestClassifier(class_weight='balanced', random_state=42, n_jobs=-1)
-    search = RandomizedSearchCV(base_model, param_distributions=param_dist, n_iter=8, cv=3, scoring='roc_auc', n_jobs=-1, random_state=42)
-    search.fit(X_train_scaled, y_train)
-    model = search.best_estimator_
-
-    # Fit final model on full data for production predictions
-    X_full_scaled = scaler.fit_transform(X)
-    model.fit(X_full_scaled, y)
-
+    X_scaled = scaler.fit_transform(X)
+    
+    # Train model
+    model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+    model.fit(X_scaled, y)
+    
     # Calculate feature importance
-    try:
-        importances = model.feature_importances_
-    except Exception:
-        importances = np.zeros(len(feature_cols))
-
     feature_importance = pd.DataFrame({
         'feature': feature_cols,
-        'importance': importances
+        'importance': model.feature_importances_
     }).sort_values('importance', ascending=False)
-
-    # Evaluate on hold-out test set
-    try:
-        y_test_pred = model.predict_proba(X_test_scaled)[:, 1]
-        test_auc = roc_auc_score(y_test, y_test_pred)
-    except Exception:
-        test_auc = np.nan
-
-    return model, scaler, le_dict, feature_cols, feature_importance, X_test, y_test, test_auc
+    
+    return model, scaler, le_dict, feature_cols, feature_importance
 
 def predict_attrition_risk(employee_id: int, df: pd.DataFrame, numeric_cols: list, 
                            categorical_cols: list, model, scaler, le_dict, feature_cols):
@@ -431,49 +370,6 @@ Your Manager"""
     
     return insights
 
-
-def generate_ai_email(employee_data: pd.Series, insights: dict) -> str:
-    """Generate a personalized email using OpenAI if available, otherwise return template."""
-    # Simple prompt builder
-    emp_id = int(employee_data.get(ID_FIELD, -1))
-    dept = employee_data.get('Department', 'the team')
-    drivers = ", ".join([f"{d[0]} (value={d[1]})" for d in insights.get('risk_drivers', [])]) or 'general check-in'
-
-    template = f"""Subject: Quick 1:1 — your growth and wellbeing
-
-Hi Employee {emp_id},
-
-I wanted to have a brief, empathetic conversation about how things are going on the {dept} team. I have noticed {drivers} and want to listen and support you.
-
-Could we schedule 30 minutes this week for a conversation? I want to understand what's working and how I can help.
-
-Best,
-Your Manager
-"""
-
-    # If OpenAI is available and API key present, call it to get a refined draft
-    try:
-        if OPENAI_AVAILABLE and os.getenv('OPENAI_API_KEY'):
-            openai.api_key = os.getenv('OPENAI_API_KEY')
-            prompt = (
-                f"You are a helpful HR manager assistant. Given the employee details: id={emp_id}, department={dept}, "
-                f"risk drivers: {drivers}. Create a short empathetic manager email (plain text) no longer than 200 words, "
-                f"inviting a 30-minute 1:1 to discuss support and growth."
-            )
-            resp = openai.ChatCompletion.create(
-                model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini') if 'OPENAI_MODEL' in os.environ else 'gpt-3.5-turbo',
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
-                temperature=0.6,
-            )
-            text = resp['choices'][0]['message']['content'].strip()
-            return text
-    except Exception:
-        # Fall back to template on any error
-        return template
-
-    return template
-
 # ============================================
 # PAGE LAYOUT
 # ============================================
@@ -512,13 +408,7 @@ if load_error:
     st.stop()
 
 # Train model
-model, scaler, le_dict, feature_cols, feature_importance, X_test, y_test, test_auc = train_attrition_model(df, numeric_cols, categorical_cols)
-
-# Pre-calculate all risk scores for faster loading
-risk_scores = {}
-for emp_id in df[ID_FIELD].unique():
-    risk_scores[emp_id] = predict_attrition_risk(emp_id, df, numeric_cols, categorical_cols, 
-                                                 model, scaler, le_dict, feature_cols)
+model, scaler, le_dict, feature_cols, feature_importance = train_attrition_model(df, numeric_cols, categorical_cols)
 
 # ============================================
 # MAIN DASHBOARD
@@ -537,7 +427,9 @@ st.header("📈 Executive Overview")
 col1, col2, col3, col4 = st.columns(4)
 
 total, attr_count, rate = compute_overview(df)
-high_risk_count = sum(1 for risk in risk_scores.values() if risk and risk >= 0.7)
+high_risk_count = sum(1 for emp_id in df[ID_FIELD].unique() 
+                      if predict_attrition_risk(emp_id, df, numeric_cols, categorical_cols, 
+                                               model, scaler, le_dict, feature_cols) >= 0.7)
 
 with col1:
     st.metric("Total Employees", f"{total:,}")
@@ -550,8 +442,6 @@ with col3:
 
 with col4:
     st.metric("High Risk Employees", f"{high_risk_count}")
-    if not np.isnan(test_auc):
-        st.caption(f"Validation AUC: {test_auc:.3f}")
 
 st.markdown("---")
 
@@ -571,13 +461,19 @@ if "Department" in df.columns:
         chart_dept = alt.Chart(dept_breakdown).mark_bar().encode(
             x=alt.X('Department:N', sort='-y', title='Department'),
             y=alt.Y('attritionRate:Q', title='Attrition Rate', axis=alt.Axis(format='%')),
-            color=alt.Color('attritionRate:Q', scale=alt.Scale(scheme='reds')),
+            color=alt.condition(
+                alt.datum.attritionRate > 0.3,
+                alt.value('#d32f2f'),
+                alt.condition(
+                    alt.datum.attritionRate > 0.15,
+                    alt.value('#f57c00'),
+                    alt.value('#388e3c')
+                )
+            ),
             tooltip=['Department:N', 'total:Q', 'attrition:Q', alt.Tooltip('attritionRate:Q', format=".1%")]
         ).properties(height=300)
         
-        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
         st.altair_chart(chart_dept, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
 # Attrition by Job Level
 if "Job_Level" in df.columns:
@@ -592,9 +488,7 @@ if "Job_Level" in df.columns:
             tooltip=['Job_Level:N', 'total:Q', 'attrition:Q', alt.Tooltip('attritionRate:Q', format=".1%")]
         ).properties(height=300)
         
-        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
         st.altair_chart(chart_level, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -610,15 +504,13 @@ with col1:
     st.subheader("🎯 Feature Importance in Churn Prediction")
     top_features = feature_importance.head(10)
     
-    chart_features = alt.Chart(top_features).mark_bar().encode(
+    chart_features = alt.Chart(top_features).mark_barh().encode(
         y=alt.Y('feature:N', sort='-x'),
         x=alt.X('importance:Q', title='Importance Score'),
         color=alt.value('#667eea')
     ).properties(height=350)
     
-    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
     st.altair_chart(chart_features, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 with col2:
     st.subheader("📋 Risk Factor Analysis")
@@ -648,7 +540,9 @@ with risk_tab1:
     st.subheader("🔴 High-Risk Employees Requiring Immediate Action")
     
     high_risk_employees = []
-    for emp_id, risk_prob in risk_scores.items():
+    for emp_id in df[ID_FIELD].unique():
+        risk_prob = predict_attrition_risk(emp_id, df, numeric_cols, categorical_cols, 
+                                           model, scaler, le_dict, feature_cols)
         if risk_prob and risk_prob >= 0.6:
             emp_data = df[df[ID_FIELD] == emp_id].iloc[0]
             high_risk_employees.append({
@@ -682,7 +576,9 @@ with risk_tab2:
     st.subheader("🟡 Medium Risk Analysis (40-60% Risk)")
     
     medium_risk_employees = []
-    for emp_id, risk_prob in risk_scores.items():
+    for emp_id in df[ID_FIELD].unique():
+        risk_prob = predict_attrition_risk(emp_id, df, numeric_cols, categorical_cols, 
+                                           model, scaler, le_dict, feature_cols)
         if risk_prob and 0.4 <= risk_prob < 0.6:
             emp_data = df[df[ID_FIELD] == emp_id].iloc[0]
             medium_risk_employees.append({
@@ -707,21 +603,16 @@ with risk_tab2:
 with risk_tab3:
     st.subheader("🔍 Individual Employee Deep Dive")
     
-    selected_emp_input = st.text_input("Enter Employee ID:", value="")
-    selected_emp = None
-    if selected_emp_input and selected_emp_input.strip():
-        try:
-            selected_emp = int(selected_emp_input.strip())
-            if selected_emp not in set(df[ID_FIELD].unique()):
-                st.error(f"Employee ID {selected_emp} not found in dataset.")
-                selected_emp = None
-        except ValueError:
-            st.error("Please enter a valid numeric Employee ID.")
-            selected_emp = None
+    selected_emp = st.selectbox(
+        "Select Employee",
+        options=sorted(df[ID_FIELD].unique()),
+        format_func=lambda x: f"Employee {int(x)}"
+    )
     
     if selected_emp:
         emp_data = df[df[ID_FIELD] == selected_emp].iloc[0]
-        risk_prob = risk_scores.get(selected_emp, 0.5)
+        risk_prob = predict_attrition_risk(selected_emp, df, numeric_cols, categorical_cols, 
+                                          model, scaler, le_dict, feature_cols)
         
         # Display risk assessment
         risk_label, risk_class = get_risk_category(risk_prob)
@@ -764,16 +655,7 @@ with risk_tab3:
         
         # Display email draft
         st.subheader("📧 Manager Email Draft")
-        # Allow optional AI-generated email when API key is available
-        ai_email = None
-        if OPENAI_AVAILABLE and os.getenv('OPENAI_API_KEY'):
-            if st.button('Generate AI email (LLM)'):
-                with st.spinner('Generating...'):
-                    ai_email = generate_ai_email(emp_data, insights)
-        if ai_email:
-            st.text_area("AI-generated email (edit if needed):", value=ai_email, height=220)
-        else:
-            st.text_area("Copy and customize this message:", value=insights['email_draft'], height=200, disabled=True)
+        st.text_area("Copy and customize this message:", value=insights['email_draft'], height=200, disabled=True)
         
         # Display manager notes
         st.subheader("📝 Manager Action Plan")
@@ -858,27 +740,18 @@ perf_col1, perf_col2 = st.columns(2)
 with perf_col1:
     st.subheader("🎯 Model Metrics")
     
-    # Calculate metrics using cached risk scores
+    # Calculate metrics
     y_true = df[ATTRITION_FIELD].fillna(0)
-    y_pred_probs = [risk_scores.get(emp_id, 0.5) for emp_id in df[ID_FIELD].unique()]
-
+    y_pred_probs = []
+    for emp_id in df[ID_FIELD].unique():
+        risk_prob = predict_attrition_risk(emp_id, df, numeric_cols, categorical_cols, 
+                                           model, scaler, le_dict, feature_cols)
+        y_pred_probs.append(risk_prob if risk_prob else 0.5)
+    
     if len(y_pred_probs) == len(y_true):
         auc_score = roc_auc_score(y_true, y_pred_probs)
         st.metric("AUC-ROC Score", f"{auc_score:.3f}")
-
-        # Calculate accuracy on full dataset after encoding
-        df_model = df.copy()
-        for col in categorical_cols:
-            if col in df_model.columns and col != ATTRITION_FIELD and col in le_dict:
-                df_model[col] = le_dict[col].transform(df_model[col].fillna('Unknown'))
-
-        X_full = df_model[feature_cols].fillna(df_model[feature_cols].mean())
-        X_full_scaled = scaler.transform(X_full)
-        accuracy = model.score(X_full_scaled, y_true)
-        st.metric("Model Accuracy", f"{accuracy:.1%}")
-        # Also show validation AUC from training (hold-out)
-        if not np.isnan(test_auc):
-            st.caption(f"Validation AUC (hold-out): {test_auc:.3f}")
+        st.metric("Model Accuracy", f"{model.score(scaler.transform(df[feature_cols].fillna(df[feature_cols].mean())), y_true):.1%}")
 
 with perf_col2:
     st.subheader("📈 Key Insights")
