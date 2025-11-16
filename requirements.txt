@@ -1,0 +1,8 @@
+# Minimal Python dependencies for the Employee Attrition Streamlit app
+# Optional/conditional packages are included because the app will still run without them
+numpy>=1.24
+pandas>=2.0
+streamlit>=1.22
+altair>=4.2
+scipy>=1.10    # optional (used for chi-square p-values)
+python-docx>=0.8.11  # optional (DOCX case study viewer)
